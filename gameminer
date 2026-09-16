@@ -142,17 +142,171 @@ if recordSupported then
 	end)
 end
 
+--------------------------------------------------------------------
+-- IMPROVEMENT 1b: STATIC REMOTE USAGE SCAN (no in-game interaction needed)
+-- If you can't manually trigger a remote to have Record Mode capture it,
+-- this instead decompiles the game's own LocalScripts/ModuleScripts and
+-- searches their source for "<RemoteName>...:FireServer(...)" / InvokeServer
+-- patterns, pulling the REAL argument expression straight out of the
+-- game's own code - no clicking required.
+--
+-- Requires the executor to expose a decompile() function. Not every
+-- executor supports this - if it's missing, the UI says so plainly instead
+-- of silently doing nothing. Even when it works, this is best-effort: some
+-- remotes are only ever fired from server-side scripts you can't read, or
+-- from a script that hasn't loaded yet, and those simply won't show a
+-- static reference - that's not a bug, there's nothing on the client to
+-- find for them.
+--------------------------------------------------------------------
+local decompileAvailable = typeof(decompile) == "function"
+local staticSamples = {} -- [fullPath] = { entries = { {argsText=..., scriptName=...}, ... } }
+local staticScanRan = false
+local MAX_SCRIPTS_TO_SCAN = 400
+local MAX_ENTRIES_PER_REMOTE = 3
+
+local function findAllScripts()
+	local list, listedAlready = {}, {}
+
+	-- Some executors expose getscripts() which can surface loaded scripts
+	-- that GetDescendants() alone might miss.
+	if typeof(getscripts) == "function" then
+		local ok, res = pcall(getscripts)
+		if ok and type(res) == "table" then
+			for _, s in ipairs(res) do
+				if (s:IsA("LocalScript") or s:IsA("ModuleScript")) and not listedAlready[s] then
+					listedAlready[s] = true
+					table.insert(list, s)
+				end
+			end
+		end
+	end
+
+	if #list == 0 then
+		for _, inst in ipairs(game:GetDescendants()) do
+			if (inst:IsA("LocalScript") or inst:IsA("ModuleScript")) and not listedAlready[inst] then
+				listedAlready[inst] = true
+				table.insert(list, inst)
+			end
+		end
+	end
+
+	return list
+end
+
+-- Walks forward from an opening '(' and returns everything up to its
+-- matching ')', so nested calls/tables inside the argument list don't
+-- confuse a naive "find the next )" approach.
+local function extractCallArgs(source, openParenPos)
+	local depth = 0
+	local len = #source
+	local startArgs = openParenPos + 1
+	local i = openParenPos
+	while i <= len do
+		local c = source:sub(i, i)
+		if c == "(" then
+			depth += 1
+		elseif c == ")" then
+			depth -= 1
+			if depth == 0 then
+				return source:sub(startArgs, i - 1)
+			end
+		end
+		i += 1
+	end
+	return nil
+end
+
+-- Given the full decompiled corpus and the position where a remote's NAME
+-- was found, looks a short distance ahead for ":FireServer(" or
+-- ":InvokeServer(" and extracts the literal argument text between the
+-- parens if found nearby.
+local function findNearbyCall(corpus, nameEndPos)
+	local windowEnd = math.min(#corpus, nameEndPos + 150)
+	local window = corpus:sub(nameEndPos, windowEnd)
+	local relPos = window:find(":%s*FireServer%s*%(") or window:find(":%s*InvokeServer%s*%(")
+	if not relPos then return nil end
+	local parenRel = window:find("%(", relPos)
+	if not parenRel then return nil end
+	local parenPos = nameEndPos + parenRel - 1
+	return extractCallArgs(corpus, parenPos)
+end
+
+-- Runs the full static scan: decompiles up to MAX_SCRIPTS_TO_SCAN scripts,
+-- builds one big text corpus, then for every known remote searches that
+-- corpus for the remote's Name followed shortly by a FireServer/
+-- InvokeServer call and records the real argument text it finds.
+local function runStaticScan(knownRemotes, progressCallback)
+	if not decompileAvailable then
+		return false, "decompile() isn't available in this executor - static scan can't run here."
+	end
+
+	local scripts = findAllScripts()
+	if #scripts > MAX_SCRIPTS_TO_SCAN then
+		-- Cap it so this can't hang the client indefinitely on a huge game.
+		local trimmed = {}
+		for i = 1, MAX_SCRIPTS_TO_SCAN do trimmed[i] = scripts[i] end
+		scripts = trimmed
+	end
+
+	local corpusParts = {}
+	for idx, s in ipairs(scripts) do
+		local ok, src = pcall(decompile, s)
+		if ok and type(src) == "string" and #src > 0 then
+			table.insert(corpusParts, "\n--SCRIPT:" .. s:GetFullName() .. "\n" .. src)
+		end
+		if idx % 20 == 0 then
+			task.wait() -- yield periodically so this doesn't freeze the client
+			if progressCallback then progressCallback(idx, #scripts) end
+		end
+	end
+	local corpus = table.concat(corpusParts, "\n")
+
+	staticSamples = {}
+	for _, r in ipairs(knownRemotes) do
+		local shortName = r.path:match("[^%.]+$") or r.path
+		if #shortName >= 3 then -- skip absurdly short/common names that would false-positive everywhere
+			local entries = {}
+			local searchFrom = 1
+			while #entries < MAX_ENTRIES_PER_REMOTE do
+				local s, e = corpus:find(shortName, searchFrom, true) -- plain text find, no pattern escaping needed
+				if not s then break end
+				local argsText = findNearbyCall(corpus, e + 1)
+				if argsText then
+					-- Figure out which script this hit came from for context.
+					local scriptMarkerStart = corpus:sub(1, s):match(".*\n%-%-SCRIPT:([^\n]+)\n") or "unknown script"
+					local dup = false
+					for _, existing in ipairs(entries) do
+						if existing.argsText == argsText then dup = true break end
+					end
+					if not dup then
+						table.insert(entries, { argsText = argsText, scriptName = scriptMarkerStart })
+					end
+				end
+				searchFrom = e + 1
+			end
+			if #entries > 0 then
+				staticSamples[r.path] = { entries = entries }
+			end
+		end
+	end
+
+	staticScanRan = true
+	return true, string.format("Scanned %d scripts, found static references for %d/%d remotes.",
+		#scripts, (function() local c=0 for _ in pairs(staticSamples) do c+=1 end return c end)(), #knownRemotes)
+end
+
 local function scanRemotes()
 	local results = {}
 	for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
 		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
 			local category = categorize(inst.Name, RemoteCategories)
-			local sample = recordedSamples[inst:GetFullName()]
+			local fullPath = inst:GetFullName()
 			table.insert(results, {
-				path = inst:GetFullName(),
+				path = fullPath,
 				className = inst.ClassName,
 				category = category,
-				sample = sample,
+				sample = recordedSamples[fullPath],
+				static = staticSamples[fullPath],
 			})
 		end
 	end
@@ -457,19 +611,37 @@ local function remotesText()
 			table.insert(lines, "  " .. r.className .. "  " .. r.path)
 			if r.sample then
 				table.insert(lines, string.format(
-					"      observed args (x%d): %s",
+					"      observed args (x%d, live): %s",
 					r.sample.count,
 					(r.sample.argsText == "" and "(none)" or r.sample.argsText)
 				))
+			end
+			if r.static then
+				for _, entry in ipairs(r.static.entries) do
+					table.insert(lines, string.format(
+						"      static ref (from %s): %s",
+						entry.scriptName,
+						(entry.argsText == "" and "(none)" or entry.argsText)
+					))
+				end
 			end
 		end
 	end
 
 	local header = string.format("REMOTES  (%d found)", #remotes)
+	local hints = {}
 	if not recordSupported then
-		header = header .. "  [Record Mode unsupported in this executor]"
+		table.insert(hints, "Record Mode unsupported in this executor")
 	elseif not recordEnabled then
-		header = header .. "  [enable Record Mode in the Live Spy tab, then trigger actions in-game to capture real arguments]"
+		table.insert(hints, "enable Record Mode + trigger actions in-game for live samples")
+	end
+	if not decompileAvailable then
+		table.insert(hints, "static scan unsupported in this executor")
+	elseif not staticScanRan then
+		table.insert(hints, "run Static Scan in Live Spy tab for no-interaction samples")
+	end
+	if #hints > 0 then
+		header = header .. "  [" .. table.concat(hints, "; ") .. "]"
 	end
 	return buildSection(header, lines)
 end
@@ -625,6 +797,21 @@ else
 		recordedSamples = {}
 		remotesLabel.Text = remotesText()
 		window:Notify("Game Miner", "Cleared.", 2)
+	end)
+end
+
+local staticCard = window:CreateCard(spyTab, "STATIC SCAN (no interaction needed)", true)
+if not decompileAvailable then
+	window:AddSectionLabel(staticCard, "decompile() isn't available in this executor, so this game's client scripts can't be read - static scan can't run here. You'll need Record Mode + manual actions instead, or an executor that supports decompile().")
+else
+	window:AddSectionLabel(staticCard, "Reads the game's OWN client scripts and pulls real FireServer/InvokeServer argument text straight from their source - no clicking required. Best-effort: remotes only ever fired server-side, or from a script that hasn't loaded, won't show a result here.")
+	window:AddButton(staticCard, "Run Static Scan", Color3.fromRGB(255, 140, 40), function()
+		window:Notify("Game Miner", "Scanning client scripts, this may take a moment...", 4)
+		task.spawn(function()
+			local ok, message = runStaticScan(remotes)
+			remotesLabel.Text = remotesText()
+			window:Notify("Game Miner", ok and message or ("Failed: " .. tostring(message)), 5)
+		end)
 	end)
 end
 
