@@ -58,6 +58,7 @@ local StatCategories = {
 	{ name = "Luck",        keywords = { "luck" } },
 	{ name = "Weight/Size", keywords = { "kg", "weight", "size", "mass" } },
 	{ name = "Flag",        keywords = { "owns", "has", "is", "vip", "unlocked" } },
+	{ name = "Time",        keywords = { "playtime", "uptime", "time" } },
 }
 
 -- Common root containers stat values tend to live under, across different
@@ -231,10 +232,32 @@ local function findNearbyCall(corpus, nameEndPos)
 	return extractCallArgs(corpus, parenPos)
 end
 
--- Runs the full static scan: decompiles up to MAX_SCRIPTS_TO_SCAN scripts,
--- builds one big text corpus, then for every known remote searches that
--- corpus for the remote's Name followed shortly by a FireServer/
--- InvokeServer call and records the real argument text it finds.
+-- Escapes Lua pattern-magic characters in a string so it can be safely
+-- dropped into a pattern (e.g. a local variable name that happens to
+-- contain "." from a reassignment like "self.Remote").
+local function escapePattern(s)
+	return (s:gsub("([%.%%%+%-%*%?%[%]%^%$%(%)])", "%%%1"))
+end
+
+-- Runs the full static scan across up to MAX_SCRIPTS_TO_SCAN scripts.
+-- Two passes per script:
+--   A) DIRECT calls - "SomeFolder.Bar:FireServer(...)" where the remote's
+--      own name sits right before the call. Rare in practice, but cheap
+--      to check.
+--   B) INDIRECT calls via a cached local variable - by far the more common
+--      real-world pattern:
+--          local Bar = ReplicatedStorage.Foo.Bar
+--          ...
+--          Bar:FireServer(x, y)
+--      Pass B scans each line for an assignment whose right-hand side
+--      mentions the remote's name, records that line's variable as an
+--      alias, then searches the WHOLE script (not just nearby) for
+--      "<alias>:FireServer(" / "InvokeServer(" and extracts the real args.
+-- Also tracks how many scripts actually decompiled to something usable,
+-- since decompile() can exist as a function yet still fail per-script
+-- (obfuscation/protection) - that's a different failure mode than "the
+-- search logic didn't find a match", and worth telling apart when the
+-- result is a flat 0.
 local function runStaticScan(knownRemotes, progressCallback)
 	if not decompileAvailable then
 		return false, "decompile() isn't available in this executor - static scan can't run here."
@@ -242,57 +265,124 @@ local function runStaticScan(knownRemotes, progressCallback)
 
 	local scripts = findAllScripts()
 	if #scripts > MAX_SCRIPTS_TO_SCAN then
-		-- Cap it so this can't hang the client indefinitely on a huge game.
 		local trimmed = {}
 		for i = 1, MAX_SCRIPTS_TO_SCAN do trimmed[i] = scripts[i] end
 		scripts = trimmed
 	end
 
-	local corpusParts = {}
+	-- PASS 0: decompile everything once and keep the source around (Pass B
+	-- needs to re-scan the full script, not just a small window).
+	local srcByScript = {}
+	local decompiledCount = 0
 	for idx, s in ipairs(scripts) do
 		local ok, src = pcall(decompile, s)
-		if ok and type(src) == "string" and #src > 0 then
-			table.insert(corpusParts, "\n--SCRIPT:" .. s:GetFullName() .. "\n" .. src)
+		if ok and type(src) == "string" and #src > 20 then
+			srcByScript[s:GetFullName()] = src
+			decompiledCount += 1
 		end
-		if idx % 20 == 0 then
-			task.wait() -- yield periodically so this doesn't freeze the client
+		if idx % 15 == 0 then
+			task.wait()
 			if progressCallback then progressCallback(idx, #scripts) end
 		end
 	end
-	local corpus = table.concat(corpusParts, "\n")
 
-	staticSamples = {}
+	if decompiledCount == 0 then
+		staticScanRan = true
+		return false, string.format(
+			"decompile() exists but returned nothing usable for any of the %d scripts checked - it's likely blocked/non-functional here, not a search-logic issue. Record Mode (manual trigger) is your fallback.",
+			#scripts
+		)
+	end
+
+	-- Build shortName -> remotePaths once instead of recomputing per script.
+	local shortNameToRemotes = {}
 	for _, r in ipairs(knownRemotes) do
 		local shortName = r.path:match("[^%.]+$") or r.path
 		if #shortName >= 3 then -- skip absurdly short/common names that would false-positive everywhere
-			local entries = {}
+			shortNameToRemotes[shortName] = shortNameToRemotes[shortName] or {}
+			table.insert(shortNameToRemotes[shortName], r.path)
+		end
+	end
+
+	staticSamples = {}
+	local function recordSample(remotePath, argsText, scriptName)
+		local bucket = staticSamples[remotePath]
+		if not bucket then
+			bucket = { entries = {} }
+			staticSamples[remotePath] = bucket
+		end
+		if #bucket.entries >= MAX_ENTRIES_PER_REMOTE then return end
+		for _, e in ipairs(bucket.entries) do
+			if e.argsText == argsText then return end -- de-dupe identical hits
+		end
+		table.insert(bucket.entries, { argsText = argsText, scriptName = scriptName })
+	end
+
+	local processed = 0
+	for scriptName, src in pairs(srcByScript) do
+		processed += 1
+
+		-- PASS A: direct calls.
+		for shortName, remotePaths in pairs(shortNameToRemotes) do
 			local searchFrom = 1
-			while #entries < MAX_ENTRIES_PER_REMOTE do
-				local s, e = corpus:find(shortName, searchFrom, true) -- plain text find, no pattern escaping needed
+			while true do
+				local s, e = src:find(shortName, searchFrom, true)
 				if not s then break end
-				local argsText = findNearbyCall(corpus, e + 1)
+				local argsText = findNearbyCall(src, e + 1)
 				if argsText then
-					-- Figure out which script this hit came from for context.
-					local scriptMarkerStart = corpus:sub(1, s):match(".*\n%-%-SCRIPT:([^\n]+)\n") or "unknown script"
-					local dup = false
-					for _, existing in ipairs(entries) do
-						if existing.argsText == argsText then dup = true break end
-					end
-					if not dup then
-						table.insert(entries, { argsText = argsText, scriptName = scriptMarkerStart })
+					for _, remotePath in ipairs(remotePaths) do
+						recordSample(remotePath, argsText, scriptName)
 					end
 				end
 				searchFrom = e + 1
 			end
-			if #entries > 0 then
-				staticSamples[r.path] = { entries = entries }
+		end
+
+		-- PASS B: indirect calls via a cached local variable - the pattern
+		-- almost all real game scripts actually use.
+		for line in src:gmatch("[^\n]+") do
+			local varName, rhs = line:match("^%s*local%s+([%w_]+)%s*=%s*(.+)$")
+			if not varName then
+				varName, rhs = line:match("([%w_%.]+)%s*=%s*(.+)$")
+			end
+			if varName and rhs then
+				for shortName, remotePaths in pairs(shortNameToRemotes) do
+					if rhs:find(shortName, 1, true) then
+						local escapedVar = escapePattern(varName)
+						local callPos = src:find(escapedVar .. "%s*:%s*FireServer%s*%(")
+							or src:find(escapedVar .. "%s*:%s*InvokeServer%s*%(")
+						if callPos then
+							local parenPos = src:find("%(", callPos)
+							local argsText = parenPos and extractCallArgs(src, parenPos)
+							if argsText then
+								for _, remotePath in ipairs(remotePaths) do
+									recordSample(remotePath, argsText, scriptName .. " (via local " .. varName .. ")")
+								end
+							end
+						end
+					end
+				end
 			end
 		end
+
+		if processed % 10 == 0 then task.wait() end
 	end
 
 	staticScanRan = true
-	return true, string.format("Scanned %d scripts, found static references for %d/%d remotes.",
-		#scripts, (function() local c=0 for _ in pairs(staticSamples) do c+=1 end return c end)(), #knownRemotes)
+	local foundCount = 0
+	for _ in pairs(staticSamples) do foundCount += 1 end
+
+	if foundCount == 0 then
+		return true, string.format(
+			"Decompiled %d/%d scripts successfully, but found no FireServer/InvokeServer references to any of the %d known remotes - directly OR via a cached local variable. This game's client code likely dispatches remotes through a shared wrapper/queue function instead of calling them inline, which static text search can't see through. Record Mode (manual trigger) is the reliable option for this game.",
+			decompiledCount, #scripts, #knownRemotes
+		)
+	end
+
+	return true, string.format(
+		"Decompiled %d/%d scripts. Found static references for %d/%d remotes.",
+		decompiledCount, #scripts, foundCount, #knownRemotes
+	)
 end
 
 local function scanRemotes()
