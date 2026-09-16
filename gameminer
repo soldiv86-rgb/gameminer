@@ -1,17 +1,23 @@
 --------------------------------------------------------------------
--- Game Data Miner
+-- Game Data Miner v2
 --
 -- Drop this into ANY Roblox game (loadstring it like any other script)
 -- to automatically discover:
 --   1. RemoteEvents/RemoteFunctions, grouped by likely purpose
---      (farming, placing, hatching, feeding, buying, etc.)
---   2. Currency/rate/stat ValueBase instances (leaderstats, SavedData,
---      Data, PlayerData, Stats), with a "best guess" of which ones are
---      worth putting on a Discord webhook
---   3. Backpack item structure - grouped by base name, with a sample
---      item's Attributes so you can see how KG/rarity/etc. are stored
---   4. Your owned plot's folders (Pets, Eggs, Nests, ...) so a future
---      auto-farm/auto-place/auto-feed loop knows where to look
+--      (farming, placing, hatching, feeding, buying, etc.), with REAL
+--      observed argument samples when Record Mode is enabled
+--   2. Currency/rate/stat value instances (leaderstats, SavedData,
+--      Data, PlayerData, Stats, or ANY container as a fallback), across
+--      Number/Int/String/Bool/Object/Color3 value types
+--   3. Backpack item structure - grouped by base name, INCLUDING the
+--      currently equipped tool (which lives on the Character, not the
+--      Backpack, while equipped)
+--   4. Your owned plot's folders (Pets, Eggs, Nests, ...), detected via
+--      ValueObject ownership, Attribute ownership, OR CollectionService
+--      tags - so games that don't use the Ride A Pet convention still
+--      get picked up
+--   5. A diff against the previous scan, so you can tell exactly what a
+--      single in-game action (opening a shop, hatching once) revealed
 --
 -- Point is: run this once on a new game, then hand the exported report
 -- back to whoever's wiring up the automation instead of them guessing
@@ -20,6 +26,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
@@ -50,11 +57,23 @@ local StatCategories = {
 	{ name = "Progression", keywords = { "level", "rebirth", "prestige", "exp", "xp", "age" } },
 	{ name = "Luck",        keywords = { "luck" } },
 	{ name = "Weight/Size", keywords = { "kg", "weight", "size", "mass" } },
+	{ name = "Flag",        keywords = { "owns", "has", "is", "vip", "unlocked" } },
 }
 
 -- Common root containers stat values tend to live under, across different
 -- games' conventions. Add more here if a game uses something unusual.
+-- If NONE of these exist (or none contain anything), scanStats() falls
+-- back to a full recursive scan of the player instance - see IMPROVEMENT 3.
 local StatContainerNames = { "leaderstats", "SavedData", "Data", "PlayerData", "Stats", "Currency" }
+
+-- Common tag names used by CollectionService for plot/base ownership, for
+-- games that don't use a Plots/<name>/Data/Owner folder convention.
+local PlotTagNames = { "Plot", "Farm", "Base", "Island", "House" }
+
+-- A StringValue whose content looks like a formatted number ("548.09M",
+-- "1.2K", "39", "0") is very likely a currency/stat display value even if
+-- its NAME doesn't match a keyword - see IMPROVEMENT 5.
+local NUMBER_LIKE_PATTERN = "^%s*%d+%.?%d*[%a]?%s*$"
 
 --------------------------------------------------------------------
 -- SCANNERS
@@ -71,33 +90,121 @@ local function categorize(name, categories)
 	return "Uncategorized", nil
 end
 
+--------------------------------------------------------------------
+-- IMPROVEMENT 1: LIVE REMOTE RECORDING
+-- Instead of only reporting remote NAMES, optionally hook __namecall while
+-- you manually interact with the game, and correlate real FireServer /
+-- InvokeServer calls with the remotes already found by scanRemotes().
+-- The exported report then shows a real observed argument sample next to
+-- any remote you triggered while recording, instead of a blind guess.
+--------------------------------------------------------------------
+local recordEnabled = false
+local recordedSamples = {} -- [fullPath] = { argsText = "...", count = n, lastSeen = os.time() }
+local recordSupported = (hookmetamethod ~= nil) and (getnamecallmethod ~= nil)
+local originalNamecall
+
+local function formatArgs(args, argCount)
+	local parts = {}
+	for i = 1, argCount do
+		local v = args[i]
+		if typeof(v) == "Instance" then
+			table.insert(parts, v:GetFullName())
+		elseif typeof(v) == "table" then
+			table.insert(parts, "{table}")
+		else
+			table.insert(parts, tostring(v))
+		end
+	end
+	return table.concat(parts, ", ")
+end
+
+if recordSupported then
+	originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+		-- Capture varargs + count HERE, in the outer vararg function - '...'
+		-- cannot be read from a nested pcall(function() ... end) below.
+		local args = { ... }
+		local argCount = select("#", ...)
+		local method = getnamecallmethod()
+
+		if recordEnabled and (method == "FireServer" or method == "InvokeServer")
+			and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+			local ok, text = pcall(formatArgs, args, argCount)
+			local path = self:GetFullName()
+			local existing = recordedSamples[path]
+			recordedSamples[path] = {
+				argsText = ok and text or "?",
+				count = (existing and existing.count or 0) + 1,
+				lastSeen = os.time(),
+			}
+		end
+
+		return originalNamecall(self, ...)
+	end)
+end
+
 local function scanRemotes()
 	local results = {}
 	for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
 		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
 			local category = categorize(inst.Name, RemoteCategories)
+			local sample = recordedSamples[inst:GetFullName()]
 			table.insert(results, {
 				path = inst:GetFullName(),
 				className = inst.ClassName,
 				category = category,
+				sample = sample,
 			})
 		end
 	end
 	return results
 end
 
+--------------------------------------------------------------------
+-- IMPROVEMENT 3 & 4 & 5: BROADER STAT SCANNING
+-- - Falls back to a full recursive scan of the player instance if none of
+--   the named containers exist or contain anything (IMPROVEMENT 3).
+-- - Recognizes Bool/Object/Color3 values in addition to Number/Int/String
+--   (IMPROVEMENT 4).
+-- - Flags StringValues whose CONTENT looks like a formatted number as
+--   high-confidence Currency even if the name doesn't match a keyword,
+--   since many games (like Campfire) pre-format "548.09M" style strings
+--   (IMPROVEMENT 5).
+--------------------------------------------------------------------
+local VALUE_CLASSES = {
+	NumberValue = true, IntValue = true, StringValue = true,
+	BoolValue = true, ObjectValue = true, Color3Value = true,
+}
+
+local function classifyValue(child)
+	local category, kw = categorize(child.Name, StatCategories)
+	if category == "Uncategorized" and child:IsA("StringValue") then
+		local val = child.Value
+		if type(val) == "string" and val:match(NUMBER_LIKE_PATTERN) then
+			category = "Currency"
+			kw = "(content looks numeric)"
+		end
+	end
+	return category, kw
+end
+
 local function scanStats()
 	local results = {}
+	local seen = {}
+
 	local function walk(container, prefix)
 		for _, child in ipairs(container:GetChildren()) do
-			if child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("StringValue") then
-				local category = categorize(child.Name, StatCategories)
-				table.insert(results, {
-					path = prefix .. "." .. child.Name,
-					className = child.ClassName,
-					value = child.Value,
-					category = category,
-				})
+			if VALUE_CLASSES[child.ClassName] then
+				local path = prefix .. "." .. child.Name
+				if not seen[path] then
+					seen[path] = true
+					local category = classifyValue(child)
+					table.insert(results, {
+						path = path,
+						className = child.ClassName,
+						value = child.Value,
+						category = category,
+					})
+				end
 			elseif child:IsA("Folder") or child:IsA("Configuration") then
 				walk(child, prefix .. "." .. child.Name)
 			end
@@ -110,6 +217,29 @@ local function scanStats()
 			walk(container, "player." .. containerName)
 		end
 	end
+
+	-- IMPROVEMENT 3: fallback full scan if the named containers turned up
+	-- nothing. Recurses through all of `player`, so it will pick up stats
+	-- stored under an unrecognized container name.
+	if #results == 0 then
+		for _, inst in ipairs(player:GetDescendants()) do
+			if VALUE_CLASSES[inst.ClassName] then
+				local path = inst:GetFullName()
+				if not seen[path] then
+					seen[path] = true
+					local category = classifyValue(inst)
+					table.insert(results, {
+						path = path,
+						className = inst.ClassName,
+						value = inst.Value,
+						category = category,
+						fallback = true,
+					})
+				end
+			end
+		end
+	end
+
 	return results
 end
 
@@ -117,12 +247,14 @@ end
 -- or trailing number stripped off, so e.g. "Golden Egg [45,231 KG]" x3 and
 -- "Golden Egg [12,004 KG]" x1 both roll up under "Golden Egg" with a count
 -- and one sample name/attribute set, instead of listing every tool.
+--
+-- IMPROVEMENT 6: also scans player.Character, since the currently equipped
+-- tool moves OUT of Backpack and into Character while it's held - without
+-- this, whatever's equipped at scan time silently vanishes from the report.
 local function scanBackpack()
-	local backpack = player:FindFirstChild("Backpack")
-	if not backpack then return {} end
-
 	local groups = {}
-	for _, tool in ipairs(backpack:GetChildren()) do
+
+	local function addTool(tool)
 		local baseName = tool.Name:gsub("%s*%[.-%]%s*$", ""):gsub("%s*%d+$", "")
 		if baseName == "" then baseName = tool.Name end
 
@@ -131,24 +263,74 @@ local function scanBackpack()
 		end
 		groups[baseName].count += 1
 	end
+
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		for _, tool in ipairs(backpack:GetChildren()) do
+			if tool:IsA("Tool") then addTool(tool) end
+		end
+	end
+
+	local char = player.Character
+	if char then
+		for _, tool in ipairs(char:GetChildren()) do
+			if tool:IsA("Tool") then addTool(tool) end
+		end
+	end
+
 	return groups
 end
 
--- Reuses the ownership pattern from Ride A Pet (Plots/<plot>/Data/Owner) -
--- adjust here if a new game signals ownership differently.
+--------------------------------------------------------------------
+-- IMPROVEMENT 2: BROADER PLOT/OWNERSHIP DETECTION
+-- Tries, in order:
+--   a) the original Plots/<plot>/Data/Owner ValueObject pattern
+--   b) Attribute-based ownership (Owner / OwnerId set directly on the plot)
+--   c) CollectionService tags (Plot/Farm/Base/Island/House), matched via
+--      an Owner/OwnerId attribute or child ValueObject on the tagged
+--      instance itself
+-- This means games that don't follow Ride A Pet's exact folder convention
+-- still get a plot detected instead of silently reporting nothing.
+--------------------------------------------------------------------
+local function ownerMatches(value)
+	if value == nil then return false end
+	if typeof(value) == "Instance" then return value == player end
+	if typeof(value) == "string" then return value == player.Name end
+	if typeof(value) == "number" then return value == player.UserId end
+	return false
+end
+
+local function isOwnedBy(inst)
+	-- (a) Data/Owner ValueObject, or Data/OwnerId
+	local data = inst:FindFirstChild("Data")
+	if data then
+		local ownerValue = data:FindFirstChild("Owner") or data:FindFirstChild("OwnerId")
+		if ownerValue and ownerMatches(ownerValue.Value) then return true end
+	end
+
+	-- (b) Attributes directly on the instance
+	local attrOwner = inst:GetAttribute("Owner") or inst:GetAttribute("OwnerId")
+	if ownerMatches(attrOwner) then return true end
+
+	return false
+end
+
 local function findOwnedPlot()
+	-- Try the classic Plots container first.
 	local plots = workspace:FindFirstChild("Plots")
-	if not plots then return nil end
-	for _, plot in ipairs(plots:GetChildren()) do
-		local data = plot:FindFirstChild("Data")
-		local ownerValue = data and data:FindFirstChild("Owner")
-		if ownerValue then
-			local owner = ownerValue.Value
-			local isMine = (typeof(owner) == "string" and owner == player.Name)
-				or (typeof(owner) == "Instance" and owner == player)
-			if isMine then return plot end
+	if plots then
+		for _, plot in ipairs(plots:GetChildren()) do
+			if isOwnedBy(plot) then return plot end
 		end
 	end
+
+	-- (c) Fall back to CollectionService tags across the whole workspace.
+	for _, tagName in ipairs(PlotTagNames) do
+		for _, inst in ipairs(CollectionService:GetTagged(tagName)) do
+			if isOwnedBy(inst) then return inst end
+		end
+	end
+
 	return nil
 end
 
@@ -173,15 +355,81 @@ local function scanPlot()
 end
 
 --------------------------------------------------------------------
+-- IMPROVEMENT 7: SCAN DIFFING
+-- Keeps a snapshot of remote paths / stat paths / backpack base names from
+-- the previous scan, so "Rescan Everything" can report exactly what's NEW
+-- since last time - lets you isolate which in-game action revealed which
+-- remote/stat instead of eyeballing two full reports.
+--------------------------------------------------------------------
+local previousSnapshot = nil -- { remotes = {[path]=true}, stats = {[path]=true}, backpack = {[name]=true} }
+
+local function buildSnapshot(remotes, stats, backpackGroups)
+	local snap = { remotes = {}, stats = {}, backpack = {} }
+	for _, r in ipairs(remotes) do snap.remotes[r.path] = true end
+	for _, s in ipairs(stats) do snap.stats[s.path] = true end
+	for name in pairs(backpackGroups) do snap.backpack[name] = true end
+	return snap
+end
+
+local function diffSets(oldSet, newSet)
+	local added = {}
+	for key in pairs(newSet) do
+		if not oldSet[key] then table.insert(added, key) end
+	end
+	table.sort(added)
+	return added
+end
+
+local function diffText(remotes, stats, backpackGroups)
+	if not previousSnapshot then
+		return "DIFF vs PREVIOUS SCAN\n  (this is the first scan - nothing to compare against yet)"
+	end
+
+	local newSnap = buildSnapshot(remotes, stats, backpackGroups)
+	local newRemotes = diffSets(previousSnapshot.remotes, newSnap.remotes)
+	local newStats = diffSets(previousSnapshot.stats, newSnap.stats)
+	local newItems = diffSets(previousSnapshot.backpack, newSnap.backpack)
+
+	local lines = {}
+	if #newRemotes == 0 and #newStats == 0 and #newItems == 0 then
+		table.insert(lines, "  (nothing new since the last scan)")
+	else
+		if #newRemotes > 0 then
+			table.insert(lines, "  New remotes:")
+			for _, p in ipairs(newRemotes) do table.insert(lines, "    " .. p) end
+		end
+		if #newStats > 0 then
+			table.insert(lines, "  New stats:")
+			for _, p in ipairs(newStats) do table.insert(lines, "    " .. p) end
+		end
+		if #newItems > 0 then
+			table.insert(lines, "  New backpack items:")
+			for _, n in ipairs(newItems) do table.insert(lines, "    " .. n) end
+		end
+	end
+
+	return "DIFF vs PREVIOUS SCAN\n" .. table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------
 -- REPORT BUILDING
 --------------------------------------------------------------------
 local remotes, stats, backpackGroups, plotName, plotFolders = {}, {}, {}, nil, {}
+local lastDiffText = ""
 
 local function runScan()
-	remotes = scanRemotes()
-	stats = scanStats()
-	backpackGroups = scanBackpack()
-	plotName, plotFolders = scanPlot()
+	local newRemotes = scanRemotes()
+	local newStats = scanStats()
+	local newBackpack = scanBackpack()
+	local newPlotName, newPlotFolders = scanPlot()
+
+	-- Compute the diff against whatever the PREVIOUS scan looked like,
+	-- before overwriting it with this scan's results.
+	lastDiffText = diffText(newRemotes, newStats, newBackpack)
+	previousSnapshot = buildSnapshot(newRemotes, newStats, newBackpack)
+
+	remotes, stats, backpackGroups, plotName, plotFolders =
+		newRemotes, newStats, newBackpack, newPlotName, newPlotFolders
 end
 
 local function buildSection(title, lines)
@@ -207,15 +455,30 @@ local function remotesText()
 		table.insert(lines, "[" .. category .. "]")
 		for _, r in ipairs(byCategory[category]) do
 			table.insert(lines, "  " .. r.className .. "  " .. r.path)
+			if r.sample then
+				table.insert(lines, string.format(
+					"      observed args (x%d): %s",
+					r.sample.count,
+					(r.sample.argsText == "" and "(none)" or r.sample.argsText)
+				))
+			end
 		end
 	end
-	return buildSection(string.format("REMOTES  (%d found)", #remotes), lines)
+
+	local header = string.format("REMOTES  (%d found)", #remotes)
+	if not recordSupported then
+		header = header .. "  [Record Mode unsupported in this executor]"
+	elseif not recordEnabled then
+		header = header .. "  [enable Record Mode in the Live Spy tab, then trigger actions in-game to capture real arguments]"
+	end
+	return buildSection(header, lines)
 end
 
 local function statsText()
 	local lines = {}
 	for _, s in ipairs(stats) do
-		table.insert(lines, string.format("  [%s] %s = %s", s.category, s.path, tostring(s.value)))
+		local tag = s.fallback and " (fallback scan)" or ""
+		table.insert(lines, string.format("  [%s] %s = %s%s", s.category, s.path, tostring(s.value), tag))
 	end
 
 	local suggestions = {}
@@ -243,13 +506,13 @@ local function backpackText()
 			table.insert(lines, "    attribute " .. attrName .. " = " .. tostring(attrValue))
 		end
 	end
-	return buildSection(string.format("BACKPACK ITEMS  (%d distinct)", count), lines)
+	return buildSection(string.format("BACKPACK ITEMS  (%d distinct, includes equipped)", count), lines)
 end
 
 local function plotText()
 	local lines = {}
 	if plotName then
-		table.insert(lines, "Owned plot: " .. plotName)
+		table.insert(lines, "Owned plot/base: " .. plotName)
 		for _, f in ipairs(plotFolders) do
 			table.insert(lines, string.format("  %s (%s, %d children)", f.name, f.className, f.childCount))
 			if f.sampleAttributes then
@@ -259,9 +522,10 @@ local function plotText()
 			end
 		end
 	else
-		table.insert(lines, "Could not find an owned plot (this game may not use the Plots/Data/Owner pattern - adjust findOwnedPlot()).")
+		table.insert(lines, "Could not find an owned plot via Plots/Data/Owner, Attributes, or CollectionService tags (" ..
+			table.concat(PlotTagNames, ", ") .. "). This game may use a different ownership convention entirely - adjust findOwnedPlot().")
 	end
-	return buildSection("OWNED PLOT", lines)
+	return buildSection("OWNED PLOT / BASE", lines)
 end
 
 local function fullReport()
@@ -279,6 +543,8 @@ local function fullReport()
 		backpackText(),
 		"",
 		plotText(),
+		"",
+		lastDiffText,
 	}, "\n")
 end
 
@@ -293,6 +559,7 @@ local remotesTab = window:CreateTab("Remotes")
 local statsTab = window:CreateTab("Stats")
 local backpackTab = window:CreateTab("Backpack")
 local plotTab = window:CreateTab("Plot")
+local spyTab = window:CreateTab("Live Spy")
 local exportTab = window:CreateTab("Export")
 
 -- A read-only scrolling text panel, used for every tab except Export.
@@ -338,12 +605,35 @@ local function refreshAll()
 end
 refreshAll()
 
+-------------------------------------------------
+-- LIVE SPY TAB (IMPROVEMENT 1 UI)
+-------------------------------------------------
+local spyCard = window:CreateCard(spyTab, "RECORD MODE", true)
+
+if not recordSupported then
+	window:AddSectionLabel(spyCard, "hookmetamethod/getnamecallmethod aren't available in this executor - Record Mode can't run here. Remotes will still be listed by name, just without observed arguments.")
+else
+	window:AddSectionLabel(spyCard, "Enable this, then manually do things in-game (buy, hatch, place, etc). Each remote you trigger gets its real argument sample attached in the Remotes tab and full report.")
+	window:AddToggle(spyCard, "Enable Record Mode", false, function(s)
+		recordEnabled = s
+	end)
+	window:AddButton(spyCard, "Refresh Remotes Tab Now", Color3.fromRGB(255, 140, 40), function()
+		remotesLabel.Text = remotesText()
+		window:Notify("Game Miner", "Remotes tab updated with latest samples.", 2)
+	end)
+	window:AddButton(spyCard, "Clear Recorded Samples", Color3.fromRGB(90, 40, 20), function()
+		recordedSamples = {}
+		remotesLabel.Text = remotesText()
+		window:Notify("Game Miner", "Cleared.", 2)
+	end)
+end
+
 -- EXPORT TAB
 local exportCard = window:CreateCard(exportTab, "EXPORT", true)
 
 window:AddButton(exportCard, "Rescan Everything", Color3.fromRGB(255, 140, 40), function()
 	refreshAll()
-	window:Notify("Game Miner", "Rescanned.", 2)
+	window:Notify("Game Miner", "Rescanned. Check the bottom of the report for what's new.", 2)
 end)
 
 window:AddButton(exportCard, "Copy Full Report to Clipboard", Color3.fromRGB(255, 120, 30), function()
@@ -363,5 +653,24 @@ window:AddButton(exportCard, "Save Report to File", Color3.fromRGB(200, 90, 20),
 		window:Notify("Game Miner", "writefile isn't available in this executor.", 4)
 	end
 end)
+
+local diffCard = window:CreateCard(exportTab, "WHAT'S NEW SINCE LAST SCAN", true)
+local diffLabel = Instance.new("TextLabel")
+diffLabel.Size = UDim2.new(1, 0, 0, 0)
+diffLabel.AutomaticSize = Enum.AutomaticSize.Y
+diffLabel.BackgroundTransparency = 1
+diffLabel.Font = Enum.Font.Code
+diffLabel.TextSize = 12
+diffLabel.TextColor3 = Color3.fromRGB(230, 180, 110)
+diffLabel.TextXAlignment = Enum.TextXAlignment.Left
+diffLabel.TextWrapped = true
+diffLabel.Text = lastDiffText
+diffLabel.Parent = diffCard
+
+local originalRefreshAll = refreshAll
+refreshAll = function()
+	originalRefreshAll()
+	diffLabel.Text = lastDiffText
+end
 
 print("[GameMiner] Scan complete - " .. #remotes .. " remotes, " .. #stats .. " stats found. Open the Export tab to copy or save the report.")
