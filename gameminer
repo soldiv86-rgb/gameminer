@@ -1,0 +1,367 @@
+--------------------------------------------------------------------
+-- Game Data Miner
+--
+-- Drop this into ANY Roblox game (loadstring it like any other script)
+-- to automatically discover:
+--   1. RemoteEvents/RemoteFunctions, grouped by likely purpose
+--      (farming, placing, hatching, feeding, buying, etc.)
+--   2. Currency/rate/stat ValueBase instances (leaderstats, SavedData,
+--      Data, PlayerData, Stats), with a "best guess" of which ones are
+--      worth putting on a Discord webhook
+--   3. Backpack item structure - grouped by base name, with a sample
+--      item's Attributes so you can see how KG/rarity/etc. are stored
+--   4. Your owned plot's folders (Pets, Eggs, Nests, ...) so a future
+--      auto-farm/auto-place/auto-feed loop knows where to look
+--
+-- Point is: run this once on a new game, then hand the exported report
+-- back to whoever's wiring up the automation instead of them guessing
+-- at names turn by turn.
+--------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Reuses the same UI library so this looks and feels like the rest of the
+-- script hub tooling instead of a bare console dump.
+local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/soldiv86-rgb/DivineSouls/main/core/ui.lua"))()
+
+--------------------------------------------------------------------
+-- CATEGORIZATION RULES
+-- Edit these lists if a new game uses different naming conventions -
+-- everything else in the file just consumes these tables.
+--------------------------------------------------------------------
+local RemoteCategories = {
+	{ name = "Farming / Collecting", keywords = { "collect", "farm", "gather", "pickup", "harvest", "claim" } },
+	{ name = "Placement",            keywords = { "place", "spawn", "unplace", "remove" } },
+	{ name = "Hatching",             keywords = { "hatch", "unbox", "open", "reveal" } },
+	{ name = "Feeding",              keywords = { "feed", "nourish", "eat" } },
+	{ name = "Economy",              keywords = { "buy", "purchase", "sell", "autobuy", "shop" } },
+	{ name = "Progression",          keywords = { "rebirth", "prestige", "levelup", "upgrade", "ascend", "reset" } },
+	{ name = "Movement",             keywords = { "teleport", "warp", "travel" } },
+	{ name = "Equip / Inventory",    keywords = { "equip", "unequip", "wear", "inventory" } },
+	{ name = "Social",               keywords = { "gift", "invite", "friend", "trade" } },
+}
+
+local StatCategories = {
+	{ name = "Currency",    keywords = { "cash", "money", "coin", "gold", "gem", "diamond", "token" } },
+	{ name = "Income Rate", keywords = { "income", "/s", "persec", "rate", "mps" } },
+	{ name = "Progression", keywords = { "level", "rebirth", "prestige", "exp", "xp", "age" } },
+	{ name = "Luck",        keywords = { "luck" } },
+	{ name = "Weight/Size", keywords = { "kg", "weight", "size", "mass" } },
+}
+
+-- Common root containers stat values tend to live under, across different
+-- games' conventions. Add more here if a game uses something unusual.
+local StatContainerNames = { "leaderstats", "SavedData", "Data", "PlayerData", "Stats", "Currency" }
+
+--------------------------------------------------------------------
+-- SCANNERS
+--------------------------------------------------------------------
+local function categorize(name, categories)
+	local lowerName = name:lower()
+	for _, cat in ipairs(categories) do
+		for _, kw in ipairs(cat.keywords) do
+			if lowerName:find(kw, 1, true) then
+				return cat.name, kw
+			end
+		end
+	end
+	return "Uncategorized", nil
+end
+
+local function scanRemotes()
+	local results = {}
+	for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+			local category = categorize(inst.Name, RemoteCategories)
+			table.insert(results, {
+				path = inst:GetFullName(),
+				className = inst.ClassName,
+				category = category,
+			})
+		end
+	end
+	return results
+end
+
+local function scanStats()
+	local results = {}
+	local function walk(container, prefix)
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("StringValue") then
+				local category = categorize(child.Name, StatCategories)
+				table.insert(results, {
+					path = prefix .. "." .. child.Name,
+					className = child.ClassName,
+					value = child.Value,
+					category = category,
+				})
+			elseif child:IsA("Folder") or child:IsA("Configuration") then
+				walk(child, prefix .. "." .. child.Name)
+			end
+		end
+	end
+
+	for _, containerName in ipairs(StatContainerNames) do
+		local container = player:FindFirstChild(containerName)
+		if container then
+			walk(container, "player." .. containerName)
+		end
+	end
+	return results
+end
+
+-- Groups backpack tools by a "base name" with any trailing "[...]" bracket
+-- or trailing number stripped off, so e.g. "Golden Egg [45,231 KG]" x3 and
+-- "Golden Egg [12,004 KG]" x1 both roll up under "Golden Egg" with a count
+-- and one sample name/attribute set, instead of listing every tool.
+local function scanBackpack()
+	local backpack = player:FindFirstChild("Backpack")
+	if not backpack then return {} end
+
+	local groups = {}
+	for _, tool in ipairs(backpack:GetChildren()) do
+		local baseName = tool.Name:gsub("%s*%[.-%]%s*$", ""):gsub("%s*%d+$", "")
+		if baseName == "" then baseName = tool.Name end
+
+		if not groups[baseName] then
+			groups[baseName] = { count = 0, sampleName = tool.Name, attributes = tool:GetAttributes() }
+		end
+		groups[baseName].count += 1
+	end
+	return groups
+end
+
+-- Reuses the ownership pattern from Ride A Pet (Plots/<plot>/Data/Owner) -
+-- adjust here if a new game signals ownership differently.
+local function findOwnedPlot()
+	local plots = workspace:FindFirstChild("Plots")
+	if not plots then return nil end
+	for _, plot in ipairs(plots:GetChildren()) do
+		local data = plot:FindFirstChild("Data")
+		local ownerValue = data and data:FindFirstChild("Owner")
+		if ownerValue then
+			local owner = ownerValue.Value
+			local isMine = (typeof(owner) == "string" and owner == player.Name)
+				or (typeof(owner) == "Instance" and owner == player)
+			if isMine then return plot end
+		end
+	end
+	return nil
+end
+
+local function scanPlot()
+	local plot = findOwnedPlot()
+	if not plot then return nil, {} end
+
+	local folders = {}
+	for _, child in ipairs(plot:GetChildren()) do
+		if child:IsA("Folder") or child:IsA("Model") then
+			local children = child:GetChildren()
+			local sampleAttributes = children[1] and children[1]:GetAttributes() or nil
+			table.insert(folders, {
+				name = child.Name,
+				className = child.ClassName,
+				childCount = #children,
+				sampleAttributes = sampleAttributes,
+			})
+		end
+	end
+	return plot.Name, folders
+end
+
+--------------------------------------------------------------------
+-- REPORT BUILDING
+--------------------------------------------------------------------
+local remotes, stats, backpackGroups, plotName, plotFolders = {}, {}, {}, nil, {}
+
+local function runScan()
+	remotes = scanRemotes()
+	stats = scanStats()
+	backpackGroups = scanBackpack()
+	plotName, plotFolders = scanPlot()
+end
+
+local function buildSection(title, lines)
+	if #lines == 0 then
+		return title .. "\n  (nothing found)"
+	end
+	return title .. "\n" .. table.concat(lines, "\n")
+end
+
+local function remotesText()
+	local byCategory = {}
+	local order = {}
+	for _, r in ipairs(remotes) do
+		if not byCategory[r.category] then
+			byCategory[r.category] = {}
+			table.insert(order, r.category)
+		end
+		table.insert(byCategory[r.category], r)
+	end
+
+	local lines = {}
+	for _, category in ipairs(order) do
+		table.insert(lines, "[" .. category .. "]")
+		for _, r in ipairs(byCategory[category]) do
+			table.insert(lines, "  " .. r.className .. "  " .. r.path)
+		end
+	end
+	return buildSection(string.format("REMOTES  (%d found)", #remotes), lines)
+end
+
+local function statsText()
+	local lines = {}
+	for _, s in ipairs(stats) do
+		table.insert(lines, string.format("  [%s] %s = %s", s.category, s.path, tostring(s.value)))
+	end
+
+	local suggestions = {}
+	for _, s in ipairs(stats) do
+		if s.category == "Currency" or s.category == "Income Rate" then
+			table.insert(suggestions, "  -> " .. s.path)
+		end
+	end
+	if #suggestions > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "Suggested webhook fields (verify these are the right ones in-game):")
+		for _, s in ipairs(suggestions) do table.insert(lines, s) end
+	end
+
+	return buildSection(string.format("STATS / CURRENCY  (%d found)", #stats), lines)
+end
+
+local function backpackText()
+	local lines = {}
+	local count = 0
+	for baseName, info in pairs(backpackGroups) do
+		count += 1
+		table.insert(lines, string.format("%s  x%d  (sample: \"%s\")", baseName, info.count, info.sampleName))
+		for attrName, attrValue in pairs(info.attributes) do
+			table.insert(lines, "    attribute " .. attrName .. " = " .. tostring(attrValue))
+		end
+	end
+	return buildSection(string.format("BACKPACK ITEMS  (%d distinct)", count), lines)
+end
+
+local function plotText()
+	local lines = {}
+	if plotName then
+		table.insert(lines, "Owned plot: " .. plotName)
+		for _, f in ipairs(plotFolders) do
+			table.insert(lines, string.format("  %s (%s, %d children)", f.name, f.className, f.childCount))
+			if f.sampleAttributes then
+				for k, v in pairs(f.sampleAttributes) do
+					table.insert(lines, "      sample attribute " .. k .. " = " .. tostring(v))
+				end
+			end
+		end
+	else
+		table.insert(lines, "Could not find an owned plot (this game may not use the Plots/Data/Owner pattern - adjust findOwnedPlot()).")
+	end
+	return buildSection("OWNED PLOT", lines)
+end
+
+local function fullReport()
+	return table.concat({
+		"========================================",
+		"GAME DATA MINER REPORT",
+		"PlaceId: " .. tostring(game.PlaceId),
+		"Player: " .. player.Name,
+		"========================================",
+		"",
+		remotesText(),
+		"",
+		statsText(),
+		"",
+		backpackText(),
+		"",
+		plotText(),
+	}, "\n")
+end
+
+--------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------
+runScan()
+
+local window = UI.new("Game Miner", "Data Recon")
+
+local remotesTab = window:CreateTab("Remotes")
+local statsTab = window:CreateTab("Stats")
+local backpackTab = window:CreateTab("Backpack")
+local plotTab = window:CreateTab("Plot")
+local exportTab = window:CreateTab("Export")
+
+-- A read-only scrolling text panel, used for every tab except Export.
+local function makeReadout(tabPage)
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(1, 0, 1, 0)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 4
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scroll.Parent = tabPage
+	local pad = Instance.new("UIPadding", scroll)
+	pad.PaddingRight = UDim.new(0, 8)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 0)
+	label.AutomaticSize = Enum.AutomaticSize.Y
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Code
+	label.TextSize = 13
+	label.TextColor3 = Color3.fromRGB(230, 180, 110)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.TextWrapped = true
+	label.Text = ""
+	label.Parent = scroll
+
+	return label
+end
+
+local remotesLabel = makeReadout(remotesTab)
+local statsLabel = makeReadout(statsTab)
+local backpackLabel = makeReadout(backpackTab)
+local plotLabel = makeReadout(plotTab)
+
+local function refreshAll()
+	runScan()
+	remotesLabel.Text = remotesText()
+	statsLabel.Text = statsText()
+	backpackLabel.Text = backpackText()
+	plotLabel.Text = plotText()
+end
+refreshAll()
+
+-- EXPORT TAB
+local exportCard = window:CreateCard(exportTab, "EXPORT", true)
+
+window:AddButton(exportCard, "Rescan Everything", Color3.fromRGB(255, 140, 40), function()
+	refreshAll()
+	window:Notify("Game Miner", "Rescanned.", 2)
+end)
+
+window:AddButton(exportCard, "Copy Full Report to Clipboard", Color3.fromRGB(255, 120, 30), function()
+	if setclipboard then
+		setclipboard(fullReport())
+		window:Notify("Game Miner", "Report copied - paste it wherever you need it.", 3)
+	else
+		window:Notify("Game Miner", "setclipboard isn't available in this executor.", 4)
+	end
+end)
+
+window:AddButton(exportCard, "Save Report to File", Color3.fromRGB(200, 90, 20), function()
+	if writefile then
+		writefile("GameMiner_Report.txt", fullReport())
+		window:Notify("Game Miner", "Saved to GameMiner_Report.txt", 3)
+	else
+		window:Notify("Game Miner", "writefile isn't available in this executor.", 4)
+	end
+end)
+
+print("[GameMiner] Scan complete - " .. #remotes .. " remotes, " .. #stats .. " stats found. Open the Export tab to copy or save the report.")
