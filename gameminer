@@ -27,12 +27,32 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
+local MarketplaceService = game:GetService("MarketplaceService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 -- Reuses the same UI library so this looks and feels like the rest of the
 -- script hub tooling instead of a bare console dump.
 local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/soldiv86-rgb/DivineSouls/main/core/ui.lua"))()
+
+--------------------------------------------------------------------
+-- GAME IDENTITY
+-- game.PlaceId is only one of three IDs worth knowing: PlaceId identifies
+-- THIS specific place, GameId (the universe id) is what groups multiple
+-- places of the same game together (a lobby + several gameplay places
+-- often share one GameId but have different PlaceIds), and neither one is
+-- a human-readable name on its own - that needs an actual API call.
+-- Fetched once at load time since it can't change mid-session.
+--------------------------------------------------------------------
+local gameName = "Unknown"
+do
+	local ok, info = pcall(function()
+		return MarketplaceService:GetProductInfo(game.PlaceId, Enum.InfoType.Asset)
+	end)
+	if ok and info and info.Name then
+		gameName = info.Name
+	end
+end
 
 --------------------------------------------------------------------
 -- CATEGORIZATION RULES
@@ -68,7 +88,7 @@ local StatCategories = {
 local StatContainerNames = { "leaderstats", "SavedData", "Data", "PlayerData", "Stats", "Currency" }
 
 -- Common tag names used by CollectionService for plot/base ownership, for
--- games that don't use a Plots/<name>/Data/Owner folder convention.
+-- games that don't use a Plots/<plot>/Data/Owner folder convention.
 local PlotTagNames = { "Plot", "Farm", "Base", "Island", "House" }
 
 -- A StringValue whose content looks like a formatted number ("548.09M",
@@ -103,6 +123,25 @@ local recordEnabled = false
 local recordedSamples = {} -- [fullPath] = { argsText = "...", count = n, lastSeen = os.time() }
 local recordSupported = (hookmetamethod ~= nil) and (getnamecallmethod ~= nil)
 local originalNamecall
+
+-- Live scrolling log, shared by both the outgoing hook below (__namecall,
+-- needs hookmetamethod) and the incoming OnClientEvent hooks further down
+-- (which need nothing executor-specific - they're just normal signals).
+-- A ring buffer rather than an ever-growing table so a chatty game doesn't
+-- slowly balloon memory over a long session.
+local liveLogEnabled = true
+local liveLogLines = {}
+local MAX_LOG_LINES = 300
+local liveLogFilter = ""
+local incomingLogEnabled = false
+
+local function pushLog(line)
+	if not liveLogEnabled then return end
+	table.insert(liveLogLines, line)
+	if #liveLogLines > MAX_LOG_LINES then
+		table.remove(liveLogLines, 1)
+	end
+end
 
 local function formatArgs(args, argCount)
 	local parts = {}
@@ -790,10 +829,107 @@ local function plotText()
 	return buildSection("OWNED PLOT / BASE", lines)
 end
 
+--------------------------------------------------------------------
+-- IMPROVEMENT 8: AUTOMATION SUGGESTIONS
+-- Turns the same category data already computed for the Remotes/Stats
+-- tabs into a plain-English "what would you actually automate here"
+-- section, instead of leaving that translation step to whoever reads the
+-- raw report. These are NAME-based heuristics only - they don't verify
+-- real behavior, and say so explicitly in the output so they don't get
+-- mistaken for confirmed facts.
+--------------------------------------------------------------------
+local RemoteSuggestions = {
+	["Farming / Collecting"] = "Good auto-farm/auto-collect target. Likely fires with the item instance (egg/resource) being collected.",
+	["Placement"]            = "Good auto-place target. Likely fires with the item (Tool or id) being placed.",
+	["Hatching"]              = "Good auto-hatch target. Likely fires with the placed item instance once it's ready.",
+	["Feeding"]               = "Good auto-feed target. Likely fires with (target instance, food item) as two arguments.",
+	["Movement"]              = "Teleport/warp target. Likely needs a destination id, zone number, or position as an argument.",
+	["Equip / Inventory"]     = "Equip/unequip target. Likely fires with the item to equip as an argument.",
+	["Social"]                = "Social action (gift/trade/invite). Usually not worth automating - low value, and can draw unwanted attention.",
+}
+
+-- Economy needs a second look at the name itself: "buy" and "sell" both
+-- match the same category, but they're opposite actions with different
+-- automation shapes.
+local function economySuggestion(remotePath)
+	local lower = remotePath:lower()
+	if lower:find("sell", 1, true) then
+		return "Possible auto-sell target. Verify what it expects (an item id, 'all', a quantity) before automating."
+	end
+	return "Good auto-buy target. Almost certainly needs an id/name argument (which upgrade/item) - "
+		.. "confirm with Record Mode or Static Scan before automating blind."
+end
+
+-- Progression (rebirth/prestige/reset) gets its own function rather than a
+-- static string so this is the one place a future edit needs to touch if
+-- the warning wording ever needs to change.
+local function progressionSuggestion()
+	return "Prestige/reset-style action - this likely WIPES currency or progress. "
+		.. "Only automate behind an explicit stat threshold you choose; never fire this unconditionally."
+end
+
+local function remoteSuggestion(r)
+	if r.category == "Economy" then return economySuggestion(r.path) end
+	if r.category == "Progression" then return progressionSuggestion() end
+	return RemoteSuggestions[r.category]
+end
+
+local StatSuggestions = {
+	["Currency"]    = "Good dashboard/webhook field.",
+	["Income Rate"] = "Good dashboard/webhook field; also a natural 'which item is best' comparison metric.",
+	["Progression"] = "Good dashboard field, and a natural trigger stat for threshold-based prestige automation.",
+	["Weight/Size"] = "Good filter criterion for auto-place logic (e.g. \"only place if >= X KG\").",
+	["Luck"]        = "Good webhook field for hatch/reward-result reporting.",
+	["Flag"]        = "Good gate condition - check this before running other automation (e.g. only auto-buy if an 'unlocked' flag is true).",
+	["Time"]        = "Good dashboard field; not typically useful as an automation trigger.",
+}
+
+local function suggestionsText()
+	local lines = {}
+
+	table.insert(lines, "Remote suggestions:")
+	local anyRemote = false
+	for _, r in ipairs(remotes) do
+		local suggestion = remoteSuggestion(r)
+		if suggestion then
+			anyRemote = true
+			table.insert(lines, "  " .. r.path)
+			table.insert(lines, "    -> " .. suggestion)
+		end
+	end
+	if not anyRemote then
+		table.insert(lines, "  (nothing categorized confidently enough to suggest - check the Remotes tab manually)")
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, "Stat suggestions:")
+	local anyStat = false
+	for _, s in ipairs(stats) do
+		local suggestion = StatSuggestions[s.category]
+		if suggestion then
+			anyStat = true
+			table.insert(lines, "  " .. s.path .. " (" .. s.category .. ")")
+			table.insert(lines, "    -> " .. suggestion)
+		end
+	end
+	if not anyStat then
+		table.insert(lines, "  (nothing categorized confidently enough to suggest - check the Stats tab manually)")
+	end
+
+	table.insert(lines, "")
+	table.insert(lines, "These are NAME-based heuristics, not verified behavior. Always confirm the real")
+	table.insert(lines, "argument signature (Record Mode or Static Scan) before wiring blind automation -")
+	table.insert(lines, "especially anything flagged under Progression, since those likely reset progress.")
+
+	return buildSection("SUGGESTED AUTOMATION", lines)
+end
+
 local function fullReport()
 	return table.concat({
 		"========================================",
 		"GAME DATA MINER REPORT",
+		"Game: " .. gameName,
+		"Universe (GameId): " .. tostring(game.GameId),
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Player: " .. player.Name,
 		"========================================",
@@ -806,6 +942,8 @@ local function fullReport()
 		"",
 		plotText(),
 		"",
+		suggestionsText(),
+		"",
 		lastDiffText,
 	}, "\n")
 end
@@ -815,12 +953,17 @@ end
 --------------------------------------------------------------------
 runScan()
 
-local window = UI.new("Game Miner", "Data Recon")
+-- Subtitle shows which game this scan is actually for, since that's the
+-- thing that changes every time you point this at a new place - "Data
+-- Recon" as a subtitle would just repeat what the sidebar title already
+-- says about the tool itself.
+local window = UI.new("Game Miner", gameName)
 
 local remotesTab = window:CreateTab("Remotes")
 local statsTab = window:CreateTab("Stats")
 local backpackTab = window:CreateTab("Backpack")
 local plotTab = window:CreateTab("Plot")
+local suggestTab = window:CreateTab("Suggestions")
 local spyTab = window:CreateTab("Live Spy")
 local exportTab = window:CreateTab("Export")
 
@@ -857,6 +1000,7 @@ local remotesLabel = makeReadout(remotesTab)
 local statsLabel = makeReadout(statsTab)
 local backpackLabel = makeReadout(backpackTab)
 local plotLabel = makeReadout(plotTab)
+local suggestLabel = makeReadout(suggestTab)
 
 local function refreshAll()
 	runScan()
@@ -864,6 +1008,7 @@ local function refreshAll()
 	statsLabel.Text = statsText()
 	backpackLabel.Text = backpackText()
 	plotLabel.Text = plotText()
+	suggestLabel.Text = suggestionsText()
 end
 refreshAll()
 
